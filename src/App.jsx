@@ -676,6 +676,23 @@ function RoleSelect({ data, setData }) {
   );
 }
 
+// ── BOQ Alert Banner (used in Dashboard) ──────────────────────────────────────
+function BOQAlert({ data, setPage }) {
+  if (!data.boq || data.boq.length === 0) return null;
+  const actuals = computeBoqActuals(data);
+  const overItems = data.boq.filter(b => (actuals[b.id]?.ordered || 0) > Number(b.tenderQty || 0));
+  if (overItems.length === 0) return null;
+  return (
+    <div style={{ background: C.redLight, border: "1.5px solid " + C.red, borderRadius: 10, padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+      <div>
+        <strong style={{ color: C.red }}>⚠️ BOQ Deviation Alert:</strong>
+        <span style={{ fontSize: 13, color: "#7F1D1D", marginLeft: 8 }}>{overItems.length} BOQ item(s) ordered beyond tendered quantity. Variation Order required.</span>
+      </div>
+      <Btn small color={C.red} onClick={() => setPage("boq")}>View BOQ Tracker</Btn>
+    </div>
+  );
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // DASHBOARD
 // ══════════════════════════════════════════════════════════════════════════════
@@ -719,20 +736,7 @@ function Dashboard({ data, setPage, role }) {
       </div>
 
 
-      {(data.boq || []).length > 0 && (() => {
-        const actuals = computeBoqActuals(data);
-        const overItems = (data.boq || []).filter(b => (actuals[b.id]?.ordered || 0) > Number(b.tenderQty || 0));
-        if (overItems.length === 0) return null;
-        return (
-          <div style={{ background: C.redLight, border: `1.5px solid ${C.red}`, borderRadius: 10, padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
-            <div>
-              <strong style={{ color: C.red }}>⚠️ BOQ Deviation Alert:</strong>
-              <span style={{ fontSize: 13, color: "#7F1D1D", marginLeft: 8 }}>{overItems.length} BOQ item(s) ordered beyond tendered quantity. Variation Order required.</span>
-            </div>
-            <Btn small color={C.red} onClick={() => setPage("boq")}>View BOQ Tracker</Btn>
-          </div>
-        );
-      })()}
+      <BOQAlert data={data} setPage={setPage} />
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(160px,1fr))", gap: 12 }}>
         {stats.map(s => (
@@ -1746,8 +1750,21 @@ export default function App() {
   const [data, setData] = useState(null);
   const [page, setPage] = useState("dashboard");
   const [editId, setEditId] = useState(null);
+  const [showInstallTip, setShowInstallTip] = useState(false);
 
   useEffect(() => { loadData().then(setData); }, []);
+
+  useEffect(() => {
+    const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+    const isStandalone = window.navigator.standalone === true;
+    const dismissed = localStorage.getItem("install_tip_dismissed");
+    if (isIOS && !isStandalone && !dismissed) setShowInstallTip(true);
+  }, []);
+
+  const dismissInstallTip = () => {
+    localStorage.setItem("install_tip_dismissed", "1");
+    setShowInstallTip(false);
+  };
 
   if (!data) return (
     <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", fontFamily: "sans-serif", color: C.navy, fontSize: 15 }}>
@@ -1788,18 +1805,7 @@ export default function App() {
     { k: "boq",       icon: "📐", l: "BOQ" },
   ];
 
-  // iOS install tip (shown once)
-  const [showInstallTip, setShowInstallTip] = React.useState(() => {
-    const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
-    const isStandalone = window.navigator.standalone === true;
-    const dismissed = localStorage.getItem("install_tip_dismissed");
-    return isIOS && !isStandalone && !dismissed;
-  });
-
-  const dismissInstallTip = () => {
-    localStorage.setItem("install_tip_dismissed", "1");
-    setShowInstallTip(false);
-  };
+  // install tip state moved to top of App
 
   return (
     <div style={{ display: "flex", minHeight: "100vh", fontFamily: "'Segoe UI',system-ui,sans-serif", background: C.bg }}>
