@@ -190,6 +190,443 @@ function doPrint(id, title) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// BOQ HELPERS  (appended — used by BOQPage, MIRForm-extended, Dashboard)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Compute how much has been ordered (from MIRs) and received (from MRNs)
+// keyed by boqId
+function computeBoqActuals(data) {
+  const actuals = {};
+  (data.boq || []).forEach(b => { actuals[b.id] = { ordered: 0, received: 0 }; });
+
+  (data.mirs || []).forEach(mir => {
+    (mir.materials || []).forEach(m => {
+      if (m.boqId && actuals[m.boqId] !== undefined) {
+        actuals[m.boqId].ordered += Number(m.required || 0);
+      }
+    });
+  });
+
+  (data.mrns || []).forEach(mrn => {
+    (mrn.materials || []).forEach(m => {
+      if (m.boqId && actuals[m.boqId] !== undefined) {
+        actuals[m.boqId].received += Number(m.received || 0);
+      }
+    });
+  });
+
+  return actuals;
+}
+
+function deviationColor(pct, threshold) {
+  if (pct > threshold + 10) return C.red;
+  if (pct > threshold) return C.amber;
+  if (pct > 90) return C.green;
+  return C.muted;
+}
+
+function DeviationBadge({ orderedQty, tenderQty, threshold }) {
+  if (!tenderQty) return <span style={{ color: C.muted, fontSize: 11 }}>—</span>;
+  const pct = Math.round((orderedQty / tenderQty) * 100);
+  const over = orderedQty > tenderQty;
+  const col = over ? C.red : pct > 85 ? C.amber : C.green;
+  return (
+    <span style={{ background: col + "18", color: col, border: `1px solid ${col}40`, borderRadius: 20, padding: "2px 9px", fontSize: 11, fontWeight: 700 }}>
+      {pct}% {over ? "⚠️ OVER" : ""}
+    </span>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BOQ PAGE
+// ══════════════════════════════════════════════════════════════════════════════
+function BOQPage({ data, setData, role }) {
+  const [tab, setTab] = useState("tracker");
+  const [csvText, setCsvText] = useState("");
+  const [csvError, setCsvError] = useState("");
+  const [newItem, setNewItem] = useState({ sno: "", description: "", unit: "", tenderQty: "", rate: "", amount: "" });
+  const [threshold, setThreshold] = useState(String(data.deviationThreshold ?? 10));
+  const [filterStatus, setFilterStatus] = useState("all");
+
+  const actuals = computeBoqActuals(data);
+  const boq = data.boq || [];
+  const canEdit = role === "pm" || role === "coord";
+
+  // Add single item
+  const addItem = () => {
+    if (!newItem.description || !newItem.tenderQty) return;
+    const item = { ...newItem, id: uid(), orderedQty: 0, receivedQty: 0 };
+    const nd = { ...data, boq: [...boq, item] };
+    setData(nd); saveData(nd);
+    setNewItem({ sno: "", description: "", unit: "", tenderQty: "", rate: "", amount: "" });
+  };
+
+  const delItem = (id) => {
+    if (!confirm("Remove this BOQ item?")) return;
+    const nd = { ...data, boq: boq.filter(b => b.id !== id) };
+    setData(nd); saveData(nd);
+  };
+
+  const saveThreshold = () => {
+    const val = Number(threshold);
+    if (isNaN(val) || val < 0) return;
+    const nd = { ...data, deviationThreshold: val };
+    setData(nd); saveData(nd);
+    alert(`Deviation threshold set to ${val}%`);
+  };
+
+  // Parse CSV / Excel paste
+  const parseCSV = () => {
+    setCsvError("");
+    const lines = csvText.trim().split("\n").filter(l => l.trim());
+    if (lines.length === 0) { setCsvError("No data found."); return; }
+
+    // Auto-detect separator
+    const sep = lines[0].includes("\t") ? "\t" : ",";
+    const parsed = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      const cols = lines[i].split(sep).map(c => c.replace(/^"|"$/g, "").trim());
+      // Skip header rows (non-numeric first column or contains "S.No" / "Item")
+      if (i === 0 && (isNaN(cols[0]) || cols[0].toLowerCase().includes("s") || cols[0].toLowerCase().includes("item"))) continue;
+      if (cols.length < 3) continue;
+      const [sno, description, unit, tenderQty, rate, amount] = cols;
+      if (!description || !tenderQty) continue;
+      parsed.push({ id: uid(), sno: sno || String(parsed.length + 1), description, unit: unit || "", tenderQty: tenderQty || "0", rate: rate || "", amount: amount || "", orderedQty: 0, receivedQty: 0 });
+    }
+
+    if (parsed.length === 0) { setCsvError("Could not parse any items. Check format: S.No | Description | Unit | Qty | Rate | Amount"); return; }
+
+    const nd = { ...data, boq: [...boq, ...parsed] };
+    setData(nd); saveData(nd);
+    setCsvText("");
+    alert(`✅ ${parsed.length} BOQ items imported!`);
+    setTab("tracker");
+  };
+
+  const clearBOQ = () => {
+    if (!confirm("Clear all BOQ items? This cannot be undone.")) return;
+    const nd = { ...data, boq: [] };
+    setData(nd); saveData(nd);
+  };
+
+  // Filter
+  const filteredBoq = boq.filter(b => {
+    const a = actuals[b.id] || { ordered: 0, received: 0 };
+    const pct = Number(b.tenderQty) > 0 ? (a.ordered / Number(b.tenderQty)) * 100 : 0;
+    if (filterStatus === "over") return a.ordered > Number(b.tenderQty);
+    if (filterStatus === "warn") return pct > 85 && a.ordered <= Number(b.tenderQty);
+    if (filterStatus === "ok") return pct <= 85;
+    return true;
+  });
+
+  // Summary stats
+  const totalItems = boq.length;
+  const overItems = boq.filter(b => (actuals[b.id]?.ordered || 0) > Number(b.tenderQty || 0)).length;
+  const warnItems = boq.filter(b => {
+    const a = actuals[b.id]; if (!a) return false;
+    const pct = Number(b.tenderQty) > 0 ? (a.ordered / Number(b.tenderQty)) * 100 : 0;
+    return pct > 85 && a.ordered <= Number(b.tenderQty);
+  }).length;
+  const totalTenderValue = boq.reduce((s, b) => s + Number(b.amount || 0), 0);
+
+  const waText = `*BOQ Status — ${data.projectName}*\n📅 ${fmtDate(today())}\nTotal items: ${totalItems}\n⚠️ Over BOQ: ${overItems}\n🔶 Near limit (>85%): ${warnItems}\n\nDeviation threshold: ${data.deviationThreshold ?? 10}%\n_Infra Site App_`;
+
+  const TABS = [
+    { k: "tracker", l: "📊 BOQ Tracker" },
+    { k: "add", l: "➕ Add Items" },
+    { k: "csv", l: "📋 Import CSV" },
+    { k: "settings", l: "⚙️ Settings" },
+  ];
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      {/* Header */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 10 }}>
+        <div>
+          <div style={{ ...FF, fontSize: 19, fontWeight: 900, color: C.navy }}>BOQ / QES Tracker</div>
+          <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>
+            Tender quantities vs ordered vs received · Deviation threshold: <strong>{data.deviationThreshold ?? 10}%</strong>
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <Btn color="#25D366" small onClick={() => wa(waText)}>💬 Share</Btn>
+          <Btn color={C.muted} small outline onClick={() => doPrint("boq-print", "BOQ Tracker")}>🖨️ Print</Btn>
+        </div>
+      </div>
+
+      {/* Summary cards */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 12 }}>
+        {[
+          { l: "BOQ Items", v: totalItems, col: C.navy },
+          { l: "⚠️ Over Tender Qty", v: overItems, col: overItems > 0 ? C.red : C.green },
+          { l: "🔶 Near Limit (>85%)", v: warnItems, col: warnItems > 0 ? C.amber : C.green },
+          { l: "Tender Value (₹)", v: totalTenderValue > 0 ? "₹" + (totalTenderValue / 100000).toFixed(1) + "L" : "—", col: C.blue },
+        ].map(s => (
+          <Card key={s.l} style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 24, fontWeight: 900, color: s.col }}>{s.v}</div>
+            <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>{s.l}</div>
+          </Card>
+        ))}
+      </div>
+
+      {/* Tabs */}
+      <div style={{ display: "flex", borderBottom: `2px solid ${C.border}`, overflowX: "auto" }}>
+        {TABS.map(t => (
+          <button key={t.k} onClick={() => setTab(t.k)}
+            style={{ ...FF, padding: "8px 16px", background: "none", border: "none", borderBottom: tab === t.k ? `3px solid ${C.orange}` : "3px solid transparent", color: tab === t.k ? C.navy : C.muted, fontWeight: tab === t.k ? 800 : 500, cursor: "pointer", fontSize: 12, whiteSpace: "nowrap" }}>
+            {t.l}
+          </button>
+        ))}
+      </div>
+
+      {/* ── TRACKER TAB ─────────────────────────────────────────── */}
+      {tab === "tracker" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {boq.length === 0 ? (
+            <Card>
+              <Empty icon="📋" msg="No BOQ items yet. Add items manually or import from CSV/Excel." />
+              <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 12 }}>
+                <Btn onClick={() => setTab("add")}>➕ Add Items</Btn>
+                <Btn color={C.green} onClick={() => setTab("csv")}>📋 Import CSV</Btn>
+              </div>
+            </Card>
+          ) : (
+            <>
+              {/* Filter bar */}
+              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                <span style={{ fontSize: 12, color: C.muted, fontWeight: 700 }}>Filter:</span>
+                {[["all", "All Items"], ["over", "⚠️ Over BOQ"], ["warn", "🔶 Near Limit"], ["ok", "✅ Within Limit"]].map(([v, l]) => (
+                  <button key={v} onClick={() => setFilterStatus(v)}
+                    style={{ ...FF, padding: "5px 12px", background: filterStatus === v ? C.navy : "transparent", color: filterStatus === v ? "#fff" : C.muted, border: `1.5px solid ${filterStatus === v ? C.navy : C.border}`, borderRadius: 20, cursor: "pointer", fontSize: 11, fontWeight: 600 }}>
+                    {l}
+                  </button>
+                ))}
+                <span style={{ fontSize: 11, color: C.muted, marginLeft: "auto" }}>{filteredBoq.length} of {totalItems} items</span>
+              </div>
+
+              <div id="boq-print">
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                    <THead cols={["S.No", "Description", "Unit", "Tender Qty", "Rate (₹)", "Tender Value (₹)", "Ordered Qty", "Received Qty", "% Used", "Deviation", canEdit ? "Del" : ""]} />
+                    <tbody>
+                      {filteredBoq.map((b, i) => {
+                        const a = actuals[b.id] || { ordered: 0, received: 0 };
+                        const tender = Number(b.tenderQty || 0);
+                        const pctOrdered = tender > 0 ? (a.ordered / tender) * 100 : 0;
+                        const isOver = a.ordered > tender;
+                        const isWarn = !isOver && pctOrdered > 85;
+                        const rowBg = isOver ? "#FFF5F5" : isWarn ? "#FFFBEB" : i % 2 ? C.navyLight : "#fff";
+                        return (
+                          <tr key={b.id} style={{ background: rowBg }}>
+                            <td style={{ padding: "7px 9px", textAlign: "center", fontWeight: 700, color: C.muted, fontSize: 11 }}>{b.sno || i + 1}</td>
+                            <td style={{ padding: "7px 9px", fontWeight: 600 }}>{b.description}</td>
+                            <td style={{ padding: "7px 9px", textAlign: "center" }}>{b.unit}</td>
+                            <td style={{ padding: "7px 9px", textAlign: "right", fontWeight: 700 }}>{Number(b.tenderQty).toLocaleString("en-IN")}</td>
+                            <td style={{ padding: "7px 9px", textAlign: "right" }}>{b.rate ? Number(b.rate).toLocaleString("en-IN") : "—"}</td>
+                            <td style={{ padding: "7px 9px", textAlign: "right" }}>{b.amount ? "₹" + Number(b.amount).toLocaleString("en-IN") : "—"}</td>
+                            <td style={{ padding: "7px 9px", textAlign: "right", fontWeight: 700, color: isOver ? C.red : C.text }}>
+                              {a.ordered.toLocaleString("en-IN")}
+                              {isOver && <span style={{ fontSize: 10, marginLeft: 4, color: C.red }}>+{(a.ordered - tender).toLocaleString("en-IN")}</span>}
+                            </td>
+                            <td style={{ padding: "7px 9px", textAlign: "right" }}>{a.received.toLocaleString("en-IN")}</td>
+                            <td style={{ padding: "7px 9px", textAlign: "center" }}>
+                              <div style={{ background: C.border, borderRadius: 6, height: 8, width: 80, overflow: "hidden", display: "inline-block", verticalAlign: "middle" }}>
+                                <div style={{ width: `${Math.min(pctOrdered, 100)}%`, height: "100%", background: isOver ? C.red : pctOrdered > 85 ? C.amber : C.green, transition: "width .3s" }} />
+                              </div>
+                              <span style={{ fontSize: 10, color: isOver ? C.red : C.muted, marginLeft: 5, fontWeight: 700 }}>{Math.round(pctOrdered)}%</span>
+                            </td>
+                            <td style={{ padding: "7px 9px", textAlign: "center" }}>
+                              <DeviationBadge orderedQty={a.ordered} tenderQty={tender} threshold={data.deviationThreshold ?? 10} />
+                            </td>
+                            {canEdit && <td style={{ padding: "7px 9px" }}><Btn small danger onClick={() => delItem(b.id)}>✕</Btn></td>}
+                            {!canEdit && <td></td>}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                    <tfoot>
+                      <tr style={{ background: C.navyLight }}>
+                        <td colSpan={5} style={{ padding: "8px 10px", fontWeight: 800, color: C.navy, fontSize: 12 }}>TOTAL</td>
+                        <td style={{ padding: "8px 9px", textAlign: "right", fontWeight: 800, color: C.navy }}>
+                          ₹{boq.reduce((s, b) => s + Number(b.amount || 0), 0).toLocaleString("en-IN")}
+                        </td>
+                        <td style={{ padding: "8px 9px", textAlign: "right", fontWeight: 800, color: C.navy }}>
+                          {boq.reduce((s, b) => s + (actuals[b.id]?.ordered || 0), 0).toLocaleString("en-IN")}
+                        </td>
+                        <td style={{ padding: "8px 9px", textAlign: "right", fontWeight: 800, color: C.navy }}>
+                          {boq.reduce((s, b) => s + (actuals[b.id]?.received || 0), 0).toLocaleString("en-IN")}
+                        </td>
+                        <td colSpan={3}></td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+              </div>
+
+              {overItems > 0 && (
+                <div style={{ background: C.redLight, border: `1.5px solid ${C.red}`, borderRadius: 10, padding: 14, fontSize: 13 }}>
+                  <strong style={{ color: C.red }}>⚠️ {overItems} item(s) have been ordered beyond the tendered quantity.</strong>
+                  <div style={{ color: "#7F1D1D", marginTop: 4, fontSize: 12 }}>
+                    A Variation Order (VO) or owner approval is required before procurement proceeds. These items are highlighted in red above.
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ── ADD ITEMS TAB ────────────────────────────────────────── */}
+      {tab === "add" && canEdit && (
+        <Card>
+          <Sec title="Add BOQ Item Manually" sub="Enter one item at a time as per QES / tender document" />
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 12 }}>
+            <Inp label="S.No / Item Code" value={newItem.sno} onChange={v => setNewItem(n => ({ ...n, sno: v }))} />
+            <Inp label="Description of Work / Material" value={newItem.description} onChange={v => setNewItem(n => ({ ...n, description: v }))} req />
+            <Inp label="Unit (cum, MT, nos, sqm…)" value={newItem.unit} onChange={v => setNewItem(n => ({ ...n, unit: v }))} />
+            <Inp label="Tendered Quantity" value={newItem.tenderQty} onChange={v => setNewItem(n => ({ ...n, tenderQty: v }))} type="number" req />
+            <Inp label="Rate (₹)" value={newItem.rate} onChange={v => setNewItem(n => ({ ...n, rate: v }))} type="number" />
+            <Inp label="Amount (₹)" value={newItem.amount} onChange={v => setNewItem(n => ({ ...n, amount: v }))} type="number" />
+          </div>
+          <div style={{ marginTop: 14, display: "flex", gap: 10 }}>
+            <Btn onClick={addItem}>+ Add Item</Btn>
+            {boq.length > 0 && <Btn outline onClick={() => setTab("tracker")}>View Tracker ({boq.length} items)</Btn>}
+          </div>
+          {boq.length > 0 && (
+            <div style={{ marginTop: 20 }}>
+              <Sec title={`Items Added (${boq.length})`} />
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                  <THead cols={["S.No", "Description", "Unit", "Tender Qty", "Rate", "Amount", "Del"]} />
+                  <tbody>
+                    {boq.map((b, i) => (
+                      <tr key={b.id} style={{ background: i % 2 ? C.navyLight : "#fff" }}>
+                        <td style={{ padding: "6px 9px" }}>{b.sno || i + 1}</td>
+                        <td style={{ padding: "6px 9px", fontWeight: 600 }}>{b.description}</td>
+                        <td style={{ padding: "6px 9px" }}>{b.unit}</td>
+                        <td style={{ padding: "6px 9px", textAlign: "right", fontWeight: 700 }}>{Number(b.tenderQty).toLocaleString("en-IN")}</td>
+                        <td style={{ padding: "6px 9px", textAlign: "right" }}>{b.rate || "—"}</td>
+                        <td style={{ padding: "6px 9px", textAlign: "right" }}>{b.amount ? "₹" + Number(b.amount).toLocaleString("en-IN") : "—"}</td>
+                        <td style={{ padding: "6px 9px" }}><Btn small danger onClick={() => delItem(b.id)}>✕</Btn></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </Card>
+      )}
+      {tab === "add" && !canEdit && (
+        <Card><div style={{ fontSize: 13, color: C.muted, textAlign: "center", padding: 30 }}>Only Project Manager or Coordinator can add BOQ items.</div></Card>
+      )}
+
+      {/* ── CSV IMPORT TAB ───────────────────────────────────────── */}
+      {tab === "csv" && canEdit && (
+        <Card>
+          <Sec title="Import from Excel / CSV" sub="Copy from Excel and paste below — handles both comma and tab-separated data" />
+
+          <div style={{ background: C.navyLight, border: `1px solid ${C.border}`, borderRadius: 8, padding: 14, marginBottom: 16, fontSize: 12, color: C.muted }}>
+            <strong style={{ color: C.navy }}>Expected column order in your Excel / CSV:</strong>
+            <div style={{ marginTop: 6, fontFamily: "monospace", background: "#fff", padding: "8px 12px", borderRadius: 6, border: `1px solid ${C.border}` }}>
+              S.No | Description | Unit | Quantity | Rate | Amount
+            </div>
+            <div style={{ marginTop: 8 }}>
+              <strong>How to paste from Excel:</strong> Select the cells in Excel → Copy (Ctrl+C) → Click in the box below → Paste (Ctrl+V).<br />
+              Header row will be auto-detected and skipped. Works with both Excel copy-paste (tab-separated) and CSV files.
+            </div>
+          </div>
+
+          <textarea value={csvText} onChange={e => setCsvText(e.target.value)}
+            placeholder={"Paste Excel data or CSV here...\n\nExample:\n1\tConcrete M25\tcum\t1200\t4500\t5400000\n2\tTMT Steel Fe500\tMT\t85\t52000\t4420000"}
+            style={{ ...FF, width: "100%", height: 200, padding: "10px 12px", border: `1.5px solid ${C.border}`, borderRadius: 8, fontSize: 12, color: C.text, resize: "vertical", outline: "none", boxSizing: "border-box" }}
+            onFocus={e => e.target.style.borderColor = C.navy}
+            onBlur={e => e.target.style.borderColor = C.border}
+          />
+
+          {csvError && (
+            <div style={{ background: C.redLight, border: `1px solid ${C.red}`, borderRadius: 7, padding: "8px 12px", fontSize: 12, color: C.red, marginTop: 8 }}>
+              ❌ {csvError}
+            </div>
+          )}
+
+          <div style={{ marginTop: 12, display: "flex", gap: 10 }}>
+            <Btn color={C.green} onClick={parseCSV} disabled={!csvText.trim()}>📥 Import Data</Btn>
+            <Btn outline onClick={() => { setCsvText(""); setCsvError(""); }}>Clear</Btn>
+            {boq.length > 0 && <Btn outline onClick={() => setTab("tracker")}>View Tracker ({boq.length} items)</Btn>}
+          </div>
+        </Card>
+      )}
+      {tab === "csv" && !canEdit && (
+        <Card><div style={{ fontSize: 13, color: C.muted, textAlign: "center", padding: 30 }}>Only Project Manager or Coordinator can import BOQ data.</div></Card>
+      )}
+
+      {/* ── SETTINGS TAB ─────────────────────────────────────────── */}
+      {tab === "settings" && (
+        <Card>
+          <Sec title="BOQ Settings" />
+          <div style={{ maxWidth: 400 }}>
+            <Lbl t="Deviation Threshold (%)" />
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 8 }}>
+              Items ordered beyond this % of tender quantity will trigger a warning. Set 0 for zero tolerance.
+            </div>
+            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              <input type="number" value={threshold} onChange={e => setThreshold(e.target.value)} min="0" max="100"
+                style={{ ...baseInput, width: 100 }} />
+              <span style={{ fontSize: 13, color: C.muted }}>%</span>
+              <Btn onClick={saveThreshold}>Save</Btn>
+            </div>
+            <div style={{ marginTop: 16, display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {[0, 5, 10, 15, 20].map(v => (
+                <button key={v} onClick={() => setThreshold(String(v))}
+                  style={{ ...FF, padding: "5px 12px", background: Number(threshold) === v ? C.navy : "transparent", color: Number(threshold) === v ? "#fff" : C.muted, border: `1.5px solid ${Number(threshold) === v ? C.navy : C.border}`, borderRadius: 20, cursor: "pointer", fontSize: 11, fontWeight: 600 }}>
+                  {v}%
+                </button>
+              ))}
+            </div>
+          </div>
+          {boq.length > 0 && canEdit && (
+            <div style={{ marginTop: 24 }}>
+              <Btn danger onClick={clearBOQ}>🗑️ Clear All BOQ Items</Btn>
+            </div>
+          )}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BOQ DEVIATION BANNER — used inside MIR and MRN forms
+// ══════════════════════════════════════════════════════════════════════════════
+function BOQDeviationAlert({ boqId, additionalQty, data }) {
+  if (!boqId || !additionalQty || !data.boq?.length) return null;
+  const item = data.boq.find(b => b.id === boqId);
+  if (!item) return null;
+  const actuals = computeBoqActuals(data);
+  const a = actuals[boqId] || { ordered: 0 };
+  const projectedOrdered = a.ordered + Number(additionalQty || 0);
+  const tender = Number(item.tenderQty || 0);
+  if (tender === 0) return null;
+  const pct = Math.round((projectedOrdered / tender) * 100);
+  const isOver = projectedOrdered > tender;
+  const threshold = data.deviationThreshold ?? 10;
+  if (!isOver && pct <= 85) return null;
+
+  return (
+    <div style={{ background: isOver ? C.redLight : C.amberLight, border: `1.5px solid ${isOver ? C.red : C.amber}`, borderRadius: 7, padding: "8px 12px", fontSize: 12, marginTop: 6 }}>
+      {isOver
+        ? <><strong style={{ color: C.red }}>⚠️ OVER TENDER QTY:</strong> <span style={{ color: "#7F1D1D" }}>This indent will take total ordered quantity to {projectedOrdered.toLocaleString("en-IN")} {item.unit} against tender qty of {tender.toLocaleString("en-IN")} {item.unit} ({pct}%). Requires Variation Order / PM approval.</span></>
+        : <><strong style={{ color: C.amber }}>🔶 Near Limit:</strong> <span style={{ color: "#78350F" }}>Projected at {pct}% of tender qty. Monitor closely before approving further indents.</span></>
+      }
+    </div>
+  );
+}
+
+
+
+// ══════════════════════════════════════════════════════════════════════════════
 // ROLE SELECT
 // ══════════════════════════════════════════════════════════════════════════════
 function RoleSelect({ data, setData }) {
@@ -1451,441 +1888,6 @@ export default function App() {
           </button>
         </div>
       )}
-    </div>
-  );
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// BOQ HELPERS  (appended — used by BOQPage, MIRForm-extended, Dashboard)
-// ══════════════════════════════════════════════════════════════════════════════
-
-// Compute how much has been ordered (from MIRs) and received (from MRNs)
-// keyed by boqId
-function computeBoqActuals(data) {
-  const actuals = {};
-  (data.boq || []).forEach(b => { actuals[b.id] = { ordered: 0, received: 0 }; });
-
-  (data.mirs || []).forEach(mir => {
-    (mir.materials || []).forEach(m => {
-      if (m.boqId && actuals[m.boqId] !== undefined) {
-        actuals[m.boqId].ordered += Number(m.required || 0);
-      }
-    });
-  });
-
-  (data.mrns || []).forEach(mrn => {
-    (mrn.materials || []).forEach(m => {
-      if (m.boqId && actuals[m.boqId] !== undefined) {
-        actuals[m.boqId].received += Number(m.received || 0);
-      }
-    });
-  });
-
-  return actuals;
-}
-
-function deviationColor(pct, threshold) {
-  if (pct > threshold + 10) return C.red;
-  if (pct > threshold) return C.amber;
-  if (pct > 90) return C.green;
-  return C.muted;
-}
-
-function DeviationBadge({ orderedQty, tenderQty, threshold }) {
-  if (!tenderQty) return <span style={{ color: C.muted, fontSize: 11 }}>—</span>;
-  const pct = Math.round((orderedQty / tenderQty) * 100);
-  const over = orderedQty > tenderQty;
-  const col = over ? C.red : pct > 85 ? C.amber : C.green;
-  return (
-    <span style={{ background: col + "18", color: col, border: `1px solid ${col}40`, borderRadius: 20, padding: "2px 9px", fontSize: 11, fontWeight: 700 }}>
-      {pct}% {over ? "⚠️ OVER" : ""}
-    </span>
-  );
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// BOQ PAGE
-// ══════════════════════════════════════════════════════════════════════════════
-function BOQPage({ data, setData, role }) {
-  const [tab, setTab] = useState("tracker");
-  const [csvText, setCsvText] = useState("");
-  const [csvError, setCsvError] = useState("");
-  const [newItem, setNewItem] = useState({ sno: "", description: "", unit: "", tenderQty: "", rate: "", amount: "" });
-  const [threshold, setThreshold] = useState(String(data.deviationThreshold ?? 10));
-  const [filterStatus, setFilterStatus] = useState("all");
-
-  const actuals = computeBoqActuals(data);
-  const boq = data.boq || [];
-  const canEdit = role === "pm" || role === "coord";
-
-  // Add single item
-  const addItem = () => {
-    if (!newItem.description || !newItem.tenderQty) return;
-    const item = { ...newItem, id: uid(), orderedQty: 0, receivedQty: 0 };
-    const nd = { ...data, boq: [...boq, item] };
-    setData(nd); saveData(nd);
-    setNewItem({ sno: "", description: "", unit: "", tenderQty: "", rate: "", amount: "" });
-  };
-
-  const delItem = (id) => {
-    if (!confirm("Remove this BOQ item?")) return;
-    const nd = { ...data, boq: boq.filter(b => b.id !== id) };
-    setData(nd); saveData(nd);
-  };
-
-  const saveThreshold = () => {
-    const val = Number(threshold);
-    if (isNaN(val) || val < 0) return;
-    const nd = { ...data, deviationThreshold: val };
-    setData(nd); saveData(nd);
-    alert(`Deviation threshold set to ${val}%`);
-  };
-
-  // Parse CSV / Excel paste
-  const parseCSV = () => {
-    setCsvError("");
-    const lines = csvText.trim().split("\n").filter(l => l.trim());
-    if (lines.length === 0) { setCsvError("No data found."); return; }
-
-    // Auto-detect separator
-    const sep = lines[0].includes("\t") ? "\t" : ",";
-    const parsed = [];
-
-    for (let i = 0; i < lines.length; i++) {
-      const cols = lines[i].split(sep).map(c => c.replace(/^"|"$/g, "").trim());
-      // Skip header rows (non-numeric first column or contains "S.No" / "Item")
-      if (i === 0 && (isNaN(cols[0]) || cols[0].toLowerCase().includes("s") || cols[0].toLowerCase().includes("item"))) continue;
-      if (cols.length < 3) continue;
-      const [sno, description, unit, tenderQty, rate, amount] = cols;
-      if (!description || !tenderQty) continue;
-      parsed.push({ id: uid(), sno: sno || String(parsed.length + 1), description, unit: unit || "", tenderQty: tenderQty || "0", rate: rate || "", amount: amount || "", orderedQty: 0, receivedQty: 0 });
-    }
-
-    if (parsed.length === 0) { setCsvError("Could not parse any items. Check format: S.No | Description | Unit | Qty | Rate | Amount"); return; }
-
-    const nd = { ...data, boq: [...boq, ...parsed] };
-    setData(nd); saveData(nd);
-    setCsvText("");
-    alert(`✅ ${parsed.length} BOQ items imported!`);
-    setTab("tracker");
-  };
-
-  const clearBOQ = () => {
-    if (!confirm("Clear all BOQ items? This cannot be undone.")) return;
-    const nd = { ...data, boq: [] };
-    setData(nd); saveData(nd);
-  };
-
-  // Filter
-  const filteredBoq = boq.filter(b => {
-    const a = actuals[b.id] || { ordered: 0, received: 0 };
-    const pct = Number(b.tenderQty) > 0 ? (a.ordered / Number(b.tenderQty)) * 100 : 0;
-    if (filterStatus === "over") return a.ordered > Number(b.tenderQty);
-    if (filterStatus === "warn") return pct > 85 && a.ordered <= Number(b.tenderQty);
-    if (filterStatus === "ok") return pct <= 85;
-    return true;
-  });
-
-  // Summary stats
-  const totalItems = boq.length;
-  const overItems = boq.filter(b => (actuals[b.id]?.ordered || 0) > Number(b.tenderQty || 0)).length;
-  const warnItems = boq.filter(b => {
-    const a = actuals[b.id]; if (!a) return false;
-    const pct = Number(b.tenderQty) > 0 ? (a.ordered / Number(b.tenderQty)) * 100 : 0;
-    return pct > 85 && a.ordered <= Number(b.tenderQty);
-  }).length;
-  const totalTenderValue = boq.reduce((s, b) => s + Number(b.amount || 0), 0);
-
-  const waText = `*BOQ Status — ${data.projectName}*\n📅 ${fmtDate(today())}\nTotal items: ${totalItems}\n⚠️ Over BOQ: ${overItems}\n🔶 Near limit (>85%): ${warnItems}\n\nDeviation threshold: ${data.deviationThreshold ?? 10}%\n_Infra Site App_`;
-
-  const TABS = [
-    { k: "tracker", l: "📊 BOQ Tracker" },
-    { k: "add", l: "➕ Add Items" },
-    { k: "csv", l: "📋 Import CSV" },
-    { k: "settings", l: "⚙️ Settings" },
-  ];
-
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      {/* Header */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 10 }}>
-        <div>
-          <div style={{ ...FF, fontSize: 19, fontWeight: 900, color: C.navy }}>BOQ / QES Tracker</div>
-          <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>
-            Tender quantities vs ordered vs received · Deviation threshold: <strong>{data.deviationThreshold ?? 10}%</strong>
-          </div>
-        </div>
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <Btn color="#25D366" small onClick={() => wa(waText)}>💬 Share</Btn>
-          <Btn color={C.muted} small outline onClick={() => doPrint("boq-print", "BOQ Tracker")}>🖨️ Print</Btn>
-        </div>
-      </div>
-
-      {/* Summary cards */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 12 }}>
-        {[
-          { l: "BOQ Items", v: totalItems, col: C.navy },
-          { l: "⚠️ Over Tender Qty", v: overItems, col: overItems > 0 ? C.red : C.green },
-          { l: "🔶 Near Limit (>85%)", v: warnItems, col: warnItems > 0 ? C.amber : C.green },
-          { l: "Tender Value (₹)", v: totalTenderValue > 0 ? "₹" + (totalTenderValue / 100000).toFixed(1) + "L" : "—", col: C.blue },
-        ].map(s => (
-          <Card key={s.l} style={{ textAlign: "center" }}>
-            <div style={{ fontSize: 24, fontWeight: 900, color: s.col }}>{s.v}</div>
-            <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>{s.l}</div>
-          </Card>
-        ))}
-      </div>
-
-      {/* Tabs */}
-      <div style={{ display: "flex", borderBottom: `2px solid ${C.border}`, overflowX: "auto" }}>
-        {TABS.map(t => (
-          <button key={t.k} onClick={() => setTab(t.k)}
-            style={{ ...FF, padding: "8px 16px", background: "none", border: "none", borderBottom: tab === t.k ? `3px solid ${C.orange}` : "3px solid transparent", color: tab === t.k ? C.navy : C.muted, fontWeight: tab === t.k ? 800 : 500, cursor: "pointer", fontSize: 12, whiteSpace: "nowrap" }}>
-            {t.l}
-          </button>
-        ))}
-      </div>
-
-      {/* ── TRACKER TAB ─────────────────────────────────────────── */}
-      {tab === "tracker" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          {boq.length === 0 ? (
-            <Card>
-              <Empty icon="📋" msg="No BOQ items yet. Add items manually or import from CSV/Excel." />
-              <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 12 }}>
-                <Btn onClick={() => setTab("add")}>➕ Add Items</Btn>
-                <Btn color={C.green} onClick={() => setTab("csv")}>📋 Import CSV</Btn>
-              </div>
-            </Card>
-          ) : (
-            <>
-              {/* Filter bar */}
-              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                <span style={{ fontSize: 12, color: C.muted, fontWeight: 700 }}>Filter:</span>
-                {[["all", "All Items"], ["over", "⚠️ Over BOQ"], ["warn", "🔶 Near Limit"], ["ok", "✅ Within Limit"]].map(([v, l]) => (
-                  <button key={v} onClick={() => setFilterStatus(v)}
-                    style={{ ...FF, padding: "5px 12px", background: filterStatus === v ? C.navy : "transparent", color: filterStatus === v ? "#fff" : C.muted, border: `1.5px solid ${filterStatus === v ? C.navy : C.border}`, borderRadius: 20, cursor: "pointer", fontSize: 11, fontWeight: 600 }}>
-                    {l}
-                  </button>
-                ))}
-                <span style={{ fontSize: 11, color: C.muted, marginLeft: "auto" }}>{filteredBoq.length} of {totalItems} items</span>
-              </div>
-
-              <div id="boq-print">
-                <div style={{ overflowX: "auto" }}>
-                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-                    <THead cols={["S.No", "Description", "Unit", "Tender Qty", "Rate (₹)", "Tender Value (₹)", "Ordered Qty", "Received Qty", "% Used", "Deviation", canEdit ? "Del" : ""]} />
-                    <tbody>
-                      {filteredBoq.map((b, i) => {
-                        const a = actuals[b.id] || { ordered: 0, received: 0 };
-                        const tender = Number(b.tenderQty || 0);
-                        const pctOrdered = tender > 0 ? (a.ordered / tender) * 100 : 0;
-                        const isOver = a.ordered > tender;
-                        const isWarn = !isOver && pctOrdered > 85;
-                        const rowBg = isOver ? "#FFF5F5" : isWarn ? "#FFFBEB" : i % 2 ? C.navyLight : "#fff";
-                        return (
-                          <tr key={b.id} style={{ background: rowBg }}>
-                            <td style={{ padding: "7px 9px", textAlign: "center", fontWeight: 700, color: C.muted, fontSize: 11 }}>{b.sno || i + 1}</td>
-                            <td style={{ padding: "7px 9px", fontWeight: 600 }}>{b.description}</td>
-                            <td style={{ padding: "7px 9px", textAlign: "center" }}>{b.unit}</td>
-                            <td style={{ padding: "7px 9px", textAlign: "right", fontWeight: 700 }}>{Number(b.tenderQty).toLocaleString("en-IN")}</td>
-                            <td style={{ padding: "7px 9px", textAlign: "right" }}>{b.rate ? Number(b.rate).toLocaleString("en-IN") : "—"}</td>
-                            <td style={{ padding: "7px 9px", textAlign: "right" }}>{b.amount ? "₹" + Number(b.amount).toLocaleString("en-IN") : "—"}</td>
-                            <td style={{ padding: "7px 9px", textAlign: "right", fontWeight: 700, color: isOver ? C.red : C.text }}>
-                              {a.ordered.toLocaleString("en-IN")}
-                              {isOver && <span style={{ fontSize: 10, marginLeft: 4, color: C.red }}>+{(a.ordered - tender).toLocaleString("en-IN")}</span>}
-                            </td>
-                            <td style={{ padding: "7px 9px", textAlign: "right" }}>{a.received.toLocaleString("en-IN")}</td>
-                            <td style={{ padding: "7px 9px", textAlign: "center" }}>
-                              <div style={{ background: C.border, borderRadius: 6, height: 8, width: 80, overflow: "hidden", display: "inline-block", verticalAlign: "middle" }}>
-                                <div style={{ width: `${Math.min(pctOrdered, 100)}%`, height: "100%", background: isOver ? C.red : pctOrdered > 85 ? C.amber : C.green, transition: "width .3s" }} />
-                              </div>
-                              <span style={{ fontSize: 10, color: isOver ? C.red : C.muted, marginLeft: 5, fontWeight: 700 }}>{Math.round(pctOrdered)}%</span>
-                            </td>
-                            <td style={{ padding: "7px 9px", textAlign: "center" }}>
-                              <DeviationBadge orderedQty={a.ordered} tenderQty={tender} threshold={data.deviationThreshold ?? 10} />
-                            </td>
-                            {canEdit && <td style={{ padding: "7px 9px" }}><Btn small danger onClick={() => delItem(b.id)}>✕</Btn></td>}
-                            {!canEdit && <td></td>}
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                    <tfoot>
-                      <tr style={{ background: C.navyLight }}>
-                        <td colSpan={5} style={{ padding: "8px 10px", fontWeight: 800, color: C.navy, fontSize: 12 }}>TOTAL</td>
-                        <td style={{ padding: "8px 9px", textAlign: "right", fontWeight: 800, color: C.navy }}>
-                          ₹{boq.reduce((s, b) => s + Number(b.amount || 0), 0).toLocaleString("en-IN")}
-                        </td>
-                        <td style={{ padding: "8px 9px", textAlign: "right", fontWeight: 800, color: C.navy }}>
-                          {boq.reduce((s, b) => s + (actuals[b.id]?.ordered || 0), 0).toLocaleString("en-IN")}
-                        </td>
-                        <td style={{ padding: "8px 9px", textAlign: "right", fontWeight: 800, color: C.navy }}>
-                          {boq.reduce((s, b) => s + (actuals[b.id]?.received || 0), 0).toLocaleString("en-IN")}
-                        </td>
-                        <td colSpan={3}></td>
-                      </tr>
-                    </tfoot>
-                  </table>
-                </div>
-              </div>
-
-              {overItems > 0 && (
-                <div style={{ background: C.redLight, border: `1.5px solid ${C.red}`, borderRadius: 10, padding: 14, fontSize: 13 }}>
-                  <strong style={{ color: C.red }}>⚠️ {overItems} item(s) have been ordered beyond the tendered quantity.</strong>
-                  <div style={{ color: "#7F1D1D", marginTop: 4, fontSize: 12 }}>
-                    A Variation Order (VO) or owner approval is required before procurement proceeds. These items are highlighted in red above.
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-        </div>
-      )}
-
-      {/* ── ADD ITEMS TAB ────────────────────────────────────────── */}
-      {tab === "add" && canEdit && (
-        <Card>
-          <Sec title="Add BOQ Item Manually" sub="Enter one item at a time as per QES / tender document" />
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: 12 }}>
-            <Inp label="S.No / Item Code" value={newItem.sno} onChange={v => setNewItem(n => ({ ...n, sno: v }))} />
-            <Inp label="Description of Work / Material" value={newItem.description} onChange={v => setNewItem(n => ({ ...n, description: v }))} req />
-            <Inp label="Unit (cum, MT, nos, sqm…)" value={newItem.unit} onChange={v => setNewItem(n => ({ ...n, unit: v }))} />
-            <Inp label="Tendered Quantity" value={newItem.tenderQty} onChange={v => setNewItem(n => ({ ...n, tenderQty: v }))} type="number" req />
-            <Inp label="Rate (₹)" value={newItem.rate} onChange={v => setNewItem(n => ({ ...n, rate: v }))} type="number" />
-            <Inp label="Amount (₹)" value={newItem.amount} onChange={v => setNewItem(n => ({ ...n, amount: v }))} type="number" />
-          </div>
-          <div style={{ marginTop: 14, display: "flex", gap: 10 }}>
-            <Btn onClick={addItem}>+ Add Item</Btn>
-            {boq.length > 0 && <Btn outline onClick={() => setTab("tracker")}>View Tracker ({boq.length} items)</Btn>}
-          </div>
-          {boq.length > 0 && (
-            <div style={{ marginTop: 20 }}>
-              <Sec title={`Items Added (${boq.length})`} />
-              <div style={{ overflowX: "auto" }}>
-                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-                  <THead cols={["S.No", "Description", "Unit", "Tender Qty", "Rate", "Amount", "Del"]} />
-                  <tbody>
-                    {boq.map((b, i) => (
-                      <tr key={b.id} style={{ background: i % 2 ? C.navyLight : "#fff" }}>
-                        <td style={{ padding: "6px 9px" }}>{b.sno || i + 1}</td>
-                        <td style={{ padding: "6px 9px", fontWeight: 600 }}>{b.description}</td>
-                        <td style={{ padding: "6px 9px" }}>{b.unit}</td>
-                        <td style={{ padding: "6px 9px", textAlign: "right", fontWeight: 700 }}>{Number(b.tenderQty).toLocaleString("en-IN")}</td>
-                        <td style={{ padding: "6px 9px", textAlign: "right" }}>{b.rate || "—"}</td>
-                        <td style={{ padding: "6px 9px", textAlign: "right" }}>{b.amount ? "₹" + Number(b.amount).toLocaleString("en-IN") : "—"}</td>
-                        <td style={{ padding: "6px 9px" }}><Btn small danger onClick={() => delItem(b.id)}>✕</Btn></td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-        </Card>
-      )}
-      {tab === "add" && !canEdit && (
-        <Card><div style={{ fontSize: 13, color: C.muted, textAlign: "center", padding: 30 }}>Only Project Manager or Coordinator can add BOQ items.</div></Card>
-      )}
-
-      {/* ── CSV IMPORT TAB ───────────────────────────────────────── */}
-      {tab === "csv" && canEdit && (
-        <Card>
-          <Sec title="Import from Excel / CSV" sub="Copy from Excel and paste below — handles both comma and tab-separated data" />
-
-          <div style={{ background: C.navyLight, border: `1px solid ${C.border}`, borderRadius: 8, padding: 14, marginBottom: 16, fontSize: 12, color: C.muted }}>
-            <strong style={{ color: C.navy }}>Expected column order in your Excel / CSV:</strong>
-            <div style={{ marginTop: 6, fontFamily: "monospace", background: "#fff", padding: "8px 12px", borderRadius: 6, border: `1px solid ${C.border}` }}>
-              S.No | Description | Unit | Quantity | Rate | Amount
-            </div>
-            <div style={{ marginTop: 8 }}>
-              <strong>How to paste from Excel:</strong> Select the cells in Excel → Copy (Ctrl+C) → Click in the box below → Paste (Ctrl+V).<br />
-              Header row will be auto-detected and skipped. Works with both Excel copy-paste (tab-separated) and CSV files.
-            </div>
-          </div>
-
-          <textarea value={csvText} onChange={e => setCsvText(e.target.value)}
-            placeholder={"Paste Excel data or CSV here...\n\nExample:\n1\tConcrete M25\tcum\t1200\t4500\t5400000\n2\tTMT Steel Fe500\tMT\t85\t52000\t4420000"}
-            style={{ ...FF, width: "100%", height: 200, padding: "10px 12px", border: `1.5px solid ${C.border}`, borderRadius: 8, fontSize: 12, color: C.text, resize: "vertical", outline: "none", boxSizing: "border-box" }}
-            onFocus={e => e.target.style.borderColor = C.navy}
-            onBlur={e => e.target.style.borderColor = C.border}
-          />
-
-          {csvError && (
-            <div style={{ background: C.redLight, border: `1px solid ${C.red}`, borderRadius: 7, padding: "8px 12px", fontSize: 12, color: C.red, marginTop: 8 }}>
-              ❌ {csvError}
-            </div>
-          )}
-
-          <div style={{ marginTop: 12, display: "flex", gap: 10 }}>
-            <Btn color={C.green} onClick={parseCSV} disabled={!csvText.trim()}>📥 Import Data</Btn>
-            <Btn outline onClick={() => { setCsvText(""); setCsvError(""); }}>Clear</Btn>
-            {boq.length > 0 && <Btn outline onClick={() => setTab("tracker")}>View Tracker ({boq.length} items)</Btn>}
-          </div>
-        </Card>
-      )}
-      {tab === "csv" && !canEdit && (
-        <Card><div style={{ fontSize: 13, color: C.muted, textAlign: "center", padding: 30 }}>Only Project Manager or Coordinator can import BOQ data.</div></Card>
-      )}
-
-      {/* ── SETTINGS TAB ─────────────────────────────────────────── */}
-      {tab === "settings" && (
-        <Card>
-          <Sec title="BOQ Settings" />
-          <div style={{ maxWidth: 400 }}>
-            <Lbl t="Deviation Threshold (%)" />
-            <div style={{ fontSize: 12, color: C.muted, marginBottom: 8 }}>
-              Items ordered beyond this % of tender quantity will trigger a warning. Set 0 for zero tolerance.
-            </div>
-            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-              <input type="number" value={threshold} onChange={e => setThreshold(e.target.value)} min="0" max="100"
-                style={{ ...baseInput, width: 100 }} />
-              <span style={{ fontSize: 13, color: C.muted }}>%</span>
-              <Btn onClick={saveThreshold}>Save</Btn>
-            </div>
-            <div style={{ marginTop: 16, display: "flex", gap: 6, flexWrap: "wrap" }}>
-              {[0, 5, 10, 15, 20].map(v => (
-                <button key={v} onClick={() => setThreshold(String(v))}
-                  style={{ ...FF, padding: "5px 12px", background: Number(threshold) === v ? C.navy : "transparent", color: Number(threshold) === v ? "#fff" : C.muted, border: `1.5px solid ${Number(threshold) === v ? C.navy : C.border}`, borderRadius: 20, cursor: "pointer", fontSize: 11, fontWeight: 600 }}>
-                  {v}%
-                </button>
-              ))}
-            </div>
-          </div>
-          {boq.length > 0 && canEdit && (
-            <div style={{ marginTop: 24 }}>
-              <Btn danger onClick={clearBOQ}>🗑️ Clear All BOQ Items</Btn>
-            </div>
-          )}
-        </Card>
-      )}
-    </div>
-  );
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// BOQ DEVIATION BANNER — used inside MIR and MRN forms
-// ══════════════════════════════════════════════════════════════════════════════
-function BOQDeviationAlert({ boqId, additionalQty, data }) {
-  if (!boqId || !additionalQty || !data.boq?.length) return null;
-  const item = data.boq.find(b => b.id === boqId);
-  if (!item) return null;
-  const actuals = computeBoqActuals(data);
-  const a = actuals[boqId] || { ordered: 0 };
-  const projectedOrdered = a.ordered + Number(additionalQty || 0);
-  const tender = Number(item.tenderQty || 0);
-  if (tender === 0) return null;
-  const pct = Math.round((projectedOrdered / tender) * 100);
-  const isOver = projectedOrdered > tender;
-  const threshold = data.deviationThreshold ?? 10;
-  if (!isOver && pct <= 85) return null;
-
-  return (
-    <div style={{ background: isOver ? C.redLight : C.amberLight, border: `1.5px solid ${isOver ? C.red : C.amber}`, borderRadius: 7, padding: "8px 12px", fontSize: 12, marginTop: 6 }}>
-      {isOver
-        ? <><strong style={{ color: C.red }}>⚠️ OVER TENDER QTY:</strong> <span style={{ color: "#7F1D1D" }}>This indent will take total ordered quantity to {projectedOrdered.toLocaleString("en-IN")} {item.unit} against tender qty of {tender.toLocaleString("en-IN")} {item.unit} ({pct}%). Requires Variation Order / PM approval.</span></>
-        : <><strong style={{ color: C.amber }}>🔶 Near Limit:</strong> <span style={{ color: "#78350F" }}>Projected at {pct}% of tender qty. Monitor closely before approving further indents.</span></>
-      }
     </div>
   );
 }
